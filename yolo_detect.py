@@ -1,32 +1,35 @@
 import os
 import sys
+import time
 import cv2
 import numpy as np
 import pandas as pd
 from datetime import datetime
 from ultralytics import YOLO
 import argparse
+from scipy.spatial import distance
 
 # ===============================
 # ARGUMENTS
 # ===============================
 parser = argparse.ArgumentParser()
-parser.add_argument('--model', type=str, default=r"C:\Users\Admin\Documents\YOLO\my_model\train\weights\best.pt",
+parser.add_argument('--model', type=str, required=True,
                     help='Path to YOLO model file (.pt)')
-parser.add_argument('--source', type=str, required=True, help='Camera/video source, e.g., 0, usb0, or video.mp4')
-parser.add_argument('--resolution', type=str, default=None, help='WxH resolution, e.g., 1280x720')
+parser.add_argument('--source', type=str, required=True,
+                    help='Camera/video source, e.g., 0, usb0, or video.mp4')
+parser.add_argument('--resolution', type=str, default=None,
+                    help='WxH resolution, e.g., 1280x720')
+parser.add_argument('--interval', type=float, default=5.0,
+                    help='Time interval in seconds between auto captures')
+parser.add_argument('--distance-thresh', type=int, default=50,
+                    help='Max distance (pixels) to consider same bottle for tracking')
 args = parser.parse_args()
 
 MODEL_PATH = args.model
 SOURCE = args.source
 RESOLUTION = args.resolution
-
-# ===============================
-# CHECK MODEL PATH
-# ===============================
-if not os.path.exists(MODEL_PATH):
-    print(f"❌ Model path not found: {MODEL_PATH}")
-    sys.exit()
+CAPTURE_INTERVAL = args.interval
+DIST_THRESH = args.distance_thresh
 
 # ===============================
 # CONFIG
@@ -39,6 +42,9 @@ os.makedirs(SAVE_IMAGE_FOLDER, exist_ok=True)
 # ===============================
 # LOAD YOLO MODEL
 # ===============================
+if not os.path.exists(MODEL_PATH):
+    print(f"❌ Model path not found: {MODEL_PATH}")
+    sys.exit()
 print("🔄 Loading YOLO model...")
 model = YOLO(MODEL_PATH)
 labels = model.names
@@ -49,11 +55,9 @@ print("✅ Model loaded successfully!")
 # ===============================
 cap = None
 try:
-    # Try converting SOURCE to integer (camera index)
     cam_index = int(SOURCE)
     cap = cv2.VideoCapture(cam_index)
 except:
-    # If SOURCE is usb0 style or a video file
     if "usb" in SOURCE:
         cam_index = int(SOURCE[3:])
         cap = cv2.VideoCapture(cam_index)
@@ -77,8 +81,14 @@ if RESOLUTION:
         print("❌ Invalid resolution format. Use WxH, e.g., 1280x720")
         sys.exit()
 
-print("📷 Press 'C' to capture bottles and save Excel data.")
-print("📷 Press 'Q' to quit.\n")
+print("📷 Auto-capture with tracking started. Press 'Q' to quit.\n")
+
+# ===============================
+# TRACKING VARIABLES
+# ===============================
+last_capture_time = 0
+bottle_id_counter = 0
+prev_centroids = []  # list of tuples (x_center, y_center, bottle_id)
 
 # ===============================
 # MAIN LOOP
@@ -92,64 +102,87 @@ while True:
     if resize:
         frame = cv2.resize(frame, (resW, resH))
 
-    # Run YOLO
+    # Run YOLO detection
     results = model(frame, verbose=False)
     detections = results[0].boxes
 
+    # Current frame centroids
+    curr_centroids = []
+
     # Draw boxes
-    for i in range(len(detections)):
-        xyxy = detections[i].xyxy.cpu().numpy().squeeze()
+    for det in detections:
+        xyxy = det.xyxy.cpu().numpy().squeeze()
         xmin, ymin, xmax, ymax = xyxy.astype(int)
-        classidx = int(detections[i].cls.item())
+        classidx = int(det.cls.item())
         classname = labels[classidx]
-        conf = detections[i].conf.item()
+        conf = det.conf.item()
         if conf >= CONF_THRESHOLD:
-            color = (0, 255, 0)
-            cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
-            label = f"{classname} ({conf*100:.1f}%)"
-            cv2.putText(frame, label, (xmin, ymin - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            # centroid
+            x_center = (xmin + xmax) // 2
+            y_center = (ymin + ymax) // 2
+            curr_centroids.append((x_center, y_center, classname, xmin, ymin, xmax, ymax))
+
+    # Match current centroids with previous centroids to assign unique IDs
+    frame_bottles = []
+    for c in curr_centroids:
+        x, y, classname, xmin, ymin, xmax, ymax = c
+        assigned_id = None
+        min_dist = float('inf')
+        for px, py, pid in prev_centroids:
+            dist = np.sqrt((x - px)**2 + (y - py)**2)
+            if dist < DIST_THRESH and dist < min_dist:
+                assigned_id = pid
+                min_dist = dist
+        if assigned_id is None:
+            bottle_id_counter += 1
+            assigned_id = bottle_id_counter
+        frame_bottles.append({
+            "Bottle_ID": assigned_id,
+            "Class_Name": classname,
+            "Xmin": xmin, "Ymin": ymin, "Xmax": xmax, "Ymax": ymax
+        })
+
+    # Update prev_centroids
+    prev_centroids = [(b["Xmin"] + (b["Xmax"]-b["Xmin"])//2,
+                       b["Ymin"] + (b["Ymax"]-b["Ymin"])//2,
+                       b["Bottle_ID"]) for b in frame_bottles]
+
+    # Draw bounding boxes with IDs
+    for b in frame_bottles:
+        color = (0, 255, 0)
+        cv2.rectangle(frame, (b["Xmin"], b["Ymin"]), (b["Xmax"], b["Ymax"]), color, 2)
+        label = f'ID:{b["Bottle_ID"]} {b["Class_Name"]}'
+        cv2.putText(frame, label, (b["Xmin"], b["Ymin"]-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
     # Display
-    cv2.imshow("Bottle Detection", frame)
+    cv2.imshow("Bottle Detection with Tracking", frame)
     key = cv2.waitKey(1) & 0xFF
-
-    # Quit
     if key == ord('q'):
         break
 
-    # Capture and save
-    elif key == ord('c'):
+    # Auto-capture every interval seconds
+    current_time = time.time()
+    if current_time - last_capture_time >= CAPTURE_INTERVAL:
+        last_capture_time = current_time
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         img_name = f"capture_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
         img_path = os.path.join(SAVE_IMAGE_FOLDER, img_name)
 
-        # Run YOLO again for accurate capture
-        results = model(frame, verbose=False)
-        detections = results[0].boxes
         bottle_data = []
+        for b in frame_bottles:
+            bottle_data.append({
+                "Timestamp": timestamp,
+                "Bottle_ID": b["Bottle_ID"],
+                "Class_Name": b["Class_Name"],
+                "Status": b["Class_Name"],
+                "Xmin": b["Xmin"],
+                "Ymin": b["Ymin"],
+                "Xmax": b["Xmax"],
+                "Ymax": b["Ymax"],
+                "Image_File": img_name
+            })
 
-        for i in range(len(detections)):
-            xyxy = detections[i].xyxy.cpu().numpy().squeeze()
-            xmin, ymin, xmax, ymax = xyxy.astype(int)
-            classidx = int(detections[i].cls.item())
-            classname = labels[classidx]  # Full/Half/Empty
-            conf = detections[i].conf.item()
-            if conf >= CONF_THRESHOLD:
-                bottle_data.append({
-                    "Timestamp": timestamp,
-                    "Bottle_ID": i + 1,
-                    "Class_Name": classname,
-                    "Status": classname,
-                    "Confidence": round(conf, 3),
-                    "Xmin": xmin,
-                    "Ymin": ymin,
-                    "Xmax": xmax,
-                    "Ymax": ymax,
-                    "Image_File": img_name
-                })
-
-        # Save image & Excel
         if bottle_data:
             cv2.imwrite(img_path, frame)
             df_new = pd.DataFrame(bottle_data)
@@ -159,10 +192,7 @@ while True:
                 df_all.to_excel(EXCEL_FILE, index=False)
             else:
                 df_new.to_excel(EXCEL_FILE, index=False)
-            print(f"💾 {len(bottle_data)} bottles saved to {EXCEL_FILE}")
-            print(f"🖼️ Image saved as {img_name}\n")
-        else:
-            print("⚠️ No bottles detected in this frame.\n")
+            print(f"💾 {len(bottle_data)} bottles saved at {timestamp}, image: {img_name}")
 
 # ===============================
 # CLEANUP
