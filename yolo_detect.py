@@ -1,39 +1,28 @@
 import os
 import sys
+import argparse
 import time
 import cv2
 import numpy as np
 import pandas as pd
 from datetime import datetime
 from ultralytics import YOLO
-import argparse
-from scipy.spatial import distance
 
 # ===============================
 # ARGUMENTS
 # ===============================
 parser = argparse.ArgumentParser()
-parser.add_argument('--model', type=str, required=True,
-                    help='Path to YOLO model file (.pt)')
-parser.add_argument('--source', type=str, required=True,
-                    help='Camera/video source, e.g., 0, usb0, or video.mp4')
-parser.add_argument('--resolution', type=str, default=None,
-                    help='WxH resolution, e.g., 1280x720')
-parser.add_argument('--interval', type=float, default=5.0,
-                    help='Time interval in seconds between auto captures')
-parser.add_argument('--distance-thresh', type=int, default=50,
-                    help='Max distance (pixels) to consider same bottle for tracking')
+parser.add_argument('--model', type=str, required=True, help='Path to YOLO model file (.pt)')
+parser.add_argument('--source', type=str, required=True, help='Camera/video source, e.g., 0 or usb0')
+parser.add_argument('--resolution', type=str, default=None, help='WxH resolution, e.g., 1280x720')
+parser.add_argument('--interval', type=float, default=5.0, help='Time interval in seconds between auto captures')
 args = parser.parse_args()
 
 MODEL_PATH = args.model
 SOURCE = args.source
 RESOLUTION = args.resolution
 CAPTURE_INTERVAL = args.interval
-DIST_THRESH = args.distance_thresh
 
-# ===============================
-# CONFIG
-# ===============================
 CONF_THRESHOLD = 0.5
 EXCEL_FILE = "bottle_data.xlsx"
 SAVE_IMAGE_FOLDER = "captures"
@@ -81,14 +70,9 @@ if RESOLUTION:
         print("❌ Invalid resolution format. Use WxH, e.g., 1280x720")
         sys.exit()
 
-print("📷 Auto-capture with tracking started. Press 'Q' to quit.\n")
-
-# ===============================
-# TRACKING VARIABLES
-# ===============================
+print("📷 Camera running. Press 'Q' to quit.\n")
 last_capture_time = 0
-bottle_id_counter = 0
-prev_centroids = []  # list of tuples (x_center, y_center, bottle_id)
+global_bottle_id = 1  # Keep unique Bottle_ID across frames
 
 # ===============================
 # MAIN LOOP
@@ -106,93 +90,67 @@ while True:
     results = model(frame, verbose=False)
     detections = results[0].boxes
 
-    # Current frame centroids
-    curr_centroids = []
+    bottle_data = []
 
-    # Draw boxes
+    # Draw green boxes and status text for detected bottles
     for det in detections:
         xyxy = det.xyxy.cpu().numpy().squeeze()
         xmin, ymin, xmax, ymax = xyxy.astype(int)
         classidx = int(det.cls.item())
-        classname = labels[classidx]
+        classname = labels[classidx]  # "Full", "Half", or "Empty"
         conf = det.conf.item()
         if conf >= CONF_THRESHOLD:
-            # centroid
-            x_center = (xmin + xmax) // 2
-            y_center = (ymin + ymax) // 2
-            curr_centroids.append((x_center, y_center, classname, xmin, ymin, xmax, ymax))
+            color = (0, 255, 0)  # green rectangle
+            cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
 
-    # Match current centroids with previous centroids to assign unique IDs
-    frame_bottles = []
-    for c in curr_centroids:
-        x, y, classname, xmin, ymin, xmax, ymax = c
-        assigned_id = None
-        min_dist = float('inf')
-        for px, py, pid in prev_centroids:
-            dist = np.sqrt((x - px)**2 + (y - py)**2)
-            if dist < DIST_THRESH and dist < min_dist:
-                assigned_id = pid
-                min_dist = dist
-        if assigned_id is None:
-            bottle_id_counter += 1
-            assigned_id = bottle_id_counter
-        frame_bottles.append({
-            "Bottle_ID": assigned_id,
-            "Class_Name": classname,
-            "Xmin": xmin, "Ymin": ymin, "Xmax": xmax, "Ymax": ymax
-        })
+            # Draw bottle status above the rectangle
+            text = classname
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.6
+            thickness = 2
+            text_size = cv2.getTextSize(text, font, font_scale, thickness)[0]
+            text_x = xmin
+            text_y = max(ymin - 5, text_size[1] + 5)
+            cv2.putText(frame, text, (text_x, text_y), font, font_scale, color, thickness)
 
-    # Update prev_centroids
-    prev_centroids = [(b["Xmin"] + (b["Xmax"]-b["Xmin"])//2,
-                       b["Ymin"] + (b["Ymax"]-b["Ymin"])//2,
-                       b["Bottle_ID"]) for b in frame_bottles]
+            # Save data for Excel with unique Bottle_ID
+            bottle_data.append({
+                "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "Bottle_ID": global_bottle_id,
+                "Class_Name": classname,
+                "Status": classname,
+                "Confidence": round(conf, 3),
+                "Xmin": xmin,
+                "Ymin": ymin,
+                "Xmax": xmax,
+                "Ymax": ymax
+            })
+            global_bottle_id += 1  # Increment for next bottle
 
-    # Draw bounding boxes with IDs
-    for b in frame_bottles:
-        color = (0, 255, 0)
-        cv2.rectangle(frame, (b["Xmin"], b["Ymin"]), (b["Xmax"], b["Ymax"]), color, 2)
-        label = f'ID:{b["Bottle_ID"]} {b["Class_Name"]}'
-        cv2.putText(frame, label, (b["Xmin"], b["Ymin"]-10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-    # Display
-    cv2.imshow("Bottle Detection with Tracking", frame)
+    # Display frame
+    cv2.imshow("Bottle Detection", frame)
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
         break
 
     # Auto-capture every interval seconds
     current_time = time.time()
-    if current_time - last_capture_time >= CAPTURE_INTERVAL:
+    if current_time - last_capture_time >= CAPTURE_INTERVAL and bottle_data:
         last_capture_time = current_time
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         img_name = f"capture_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
         img_path = os.path.join(SAVE_IMAGE_FOLDER, img_name)
+        cv2.imwrite(img_path, frame)
 
-        bottle_data = []
-        for b in frame_bottles:
-            bottle_data.append({
-                "Timestamp": timestamp,
-                "Bottle_ID": b["Bottle_ID"],
-                "Class_Name": b["Class_Name"],
-                "Status": b["Class_Name"],
-                "Xmin": b["Xmin"],
-                "Ymin": b["Ymin"],
-                "Xmax": b["Xmax"],
-                "Ymax": b["Ymax"],
-                "Image_File": img_name
-            })
+        df_new = pd.DataFrame(bottle_data)
+        df_new["Image_File"] = img_name
+        if os.path.exists(EXCEL_FILE):
+            df_existing = pd.read_excel(EXCEL_FILE)
+            df_all = pd.concat([df_existing, df_new], ignore_index=True)
+            df_all.to_excel(EXCEL_FILE, index=False)
+        else:
+            df_new.to_excel(EXCEL_FILE, index=False)
 
-        if bottle_data:
-            cv2.imwrite(img_path, frame)
-            df_new = pd.DataFrame(bottle_data)
-            if os.path.exists(EXCEL_FILE):
-                df_existing = pd.read_excel(EXCEL_FILE)
-                df_all = pd.concat([df_existing, df_new], ignore_index=True)
-                df_all.to_excel(EXCEL_FILE, index=False)
-            else:
-                df_new.to_excel(EXCEL_FILE, index=False)
-            print(f"💾 {len(bottle_data)} bottles saved at {timestamp}, image: {img_name}")
+        print(f"💾 {len(bottle_data)} bottles saved, image: {img_name}")
 
 # ===============================
 # CLEANUP
