@@ -13,7 +13,7 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument('--model', type=str, default=r"C:\Users\Admin\Documents\YOLO\my_model\train\weights\best.pt",
                     help='Path to YOLO model file (.pt)')
-parser.add_argument('--source', type=str, required=True, help='Camera/video source, e.g., usb0 or video.mp4')
+parser.add_argument('--source', type=str, required=True, help='Camera/video source, e.g., 0, usb0, or video.mp4')
 parser.add_argument('--resolution', type=str, default=None, help='WxH resolution, e.g., 1280x720')
 args = parser.parse_args()
 
@@ -47,16 +47,23 @@ print("✅ Model loaded successfully!")
 # ===============================
 # OPEN CAMERA OR VIDEO
 # ===============================
-if "usb" in SOURCE:
-    cam_index = int(SOURCE[3:])  # convert usb0 → 0
+cap = None
+try:
+    # Try converting SOURCE to integer (camera index)
+    cam_index = int(SOURCE)
     cap = cv2.VideoCapture(cam_index)
-elif os.path.isfile(SOURCE):
-    cap = cv2.VideoCapture(SOURCE)
-else:
-    print(f"❌ Invalid source: {SOURCE}")
-    sys.exit()
+except:
+    # If SOURCE is usb0 style or a video file
+    if "usb" in SOURCE:
+        cam_index = int(SOURCE[3:])
+        cap = cv2.VideoCapture(cam_index)
+    elif os.path.isfile(SOURCE):
+        cap = cv2.VideoCapture(SOURCE)
+    else:
+        print(f"❌ Invalid source: {SOURCE}")
+        sys.exit()
 
-if not cap.isOpened():
+if not cap or not cap.isOpened():
     print("❌ Camera/video not detected.")
     sys.exit()
 
