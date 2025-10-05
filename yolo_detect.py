@@ -11,7 +11,8 @@ import argparse
 # ARGUMENTS
 # ===============================
 parser = argparse.ArgumentParser()
-parser.add_argument('--model', type=str, required=True, help='Path to YOLO model file (.pt)')
+parser.add_argument('--model', type=str, default=r"C:\Users\Admin\Documents\YOLO\my_model\train\weights\best.pt",
+                    help='Path to YOLO model file (.pt)')
 parser.add_argument('--source', type=str, required=True, help='Camera/video source, e.g., usb0 or video.mp4')
 parser.add_argument('--resolution', type=str, default=None, help='WxH resolution, e.g., 1280x720')
 args = parser.parse_args()
