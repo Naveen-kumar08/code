@@ -1,112 +1,203 @@
-import cv2
 import os
-from datetime import datetime
+import sys
+import argparse
+import glob
+import time
+import cv2
+import numpy as np
+import pandas as pd
 from ultralytics import YOLO
-from openpyxl import Workbook, load_workbook
 
-# ---------------------- YOLO Model ----------------------
-model_path = r"C:\Users\Admin\Documents\YOLO\my_model\train\weights\best.pt"
-model = YOLO(model_path)
+# =======================
+# Argument Parser
+# =======================
+parser = argparse.ArgumentParser()
+parser.add_argument('--model', required=True, help='Path to YOLO model file (example: runs/detect/train/weights/best.pt)')
+parser.add_argument('--source', required=True, help='Image source: image file, folder, video file, or usb0')
+parser.add_argument('--thresh', default=0.5, help='Confidence threshold (default: 0.5)')
+parser.add_argument('--resolution', default=None, help='Resolution WxH (example: 640x480)')
+parser.add_argument('--record', action='store_true', help='Record output video (works with --resolution)')
+args = parser.parse_args()
+
+# =======================
+# Basic Setup
+# =======================
+model_path = args.model
+img_source = args.source
+min_thresh = args.thresh
+user_res = args.resolution
+record = args.record
+
+if not os.path.exists(model_path):
+    print('ERROR: Model not found. Check the path again.')
+    sys.exit(0)
+
+model = YOLO(model_path, task='detect')
 labels = model.names
 
-# ---------------------- Folder Setup ----------------------
-image_folder = "Captured_Images"
-os.makedirs(image_folder, exist_ok=True)
+img_ext_list = ['.jpg','.jpeg','.png','.bmp']
+vid_ext_list = ['.avi','.mov','.mp4','.mkv','.wmv']
 
-# ---------------------- Excel Setup ----------------------
-excel_file = 'detected_levels.xlsx'
-if not os.path.exists(excel_file):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Detections"
-    ws.append(["S.No", "Timestamp", "Captured Image", "Detected Level",
-               "Confidence (%)", "X", "Y", "Width", "Height"])
-    wb.save(excel_file)
+if os.path.isdir(img_source):
+    source_type = 'folder'
+elif os.path.isfile(img_source):
+    _, ext = os.path.splitext(img_source)
+    if ext in img_ext_list: source_type = 'image'
+    elif ext in vid_ext_list: source_type = 'video'
+    else:
+        print('Unsupported file type.')
+        sys.exit(0)
+elif 'usb' in img_source:
+    source_type = 'usb'
+    usb_idx = int(img_source[3:])
 else:
-    wb = load_workbook(excel_file)
-    ws = wb.active
+    print('Invalid source input.')
+    sys.exit(0)
 
-# Find next serial number automatically
-serial_no = ws.max_row  # header row counts as 1
+resize = False
+if user_res:
+    resize = True
+    resW, resH = map(int, user_res.split('x'))
 
-# ---------------------- Camera Setup ----------------------
-cap = cv2.VideoCapture(0)
-print("Press 'C' to capture, 'Q' to quit")
+if record:
+    if source_type not in ['video', 'usb']:
+        print('Recording only available for video/camera sources.')
+        sys.exit(0)
+    if not user_res:
+        print('Please specify --resolution for recording.')
+        sys.exit(0)
+    recorder = cv2.VideoWriter('demo1.avi', cv2.VideoWriter_fourcc(*'MJPG'), 30, (resW,resH))
 
+if source_type == 'image':
+    imgs_list = [img_source]
+elif source_type == 'folder':
+    imgs_list = [f for f in glob.glob(img_source + '/*') if os.path.splitext(f)[1].lower() in img_ext_list]
+elif source_type in ['video','usb']:
+    cap = cv2.VideoCapture(img_source if source_type=='video' else usb_idx)
+    if user_res:
+        cap.set(3, resW)
+        cap.set(4, resH)
+
+bbox_colors = [(164,120,87), (68,148,228), (93,97,209), (178,182,133), (88,159,106), 
+              (96,202,231), (159,124,168), (169,162,241), (98,118,150), (172,176,184)]
+
+avg_frame_rate = 0
+frame_rate_buffer = []
+fps_avg_len = 200
+img_count = 0
+image_number = 1  # Counter for image naming
+
+# =======================
+# Create Folders
+# =======================
+capture_dir = "captures"
+if not os.path.exists(capture_dir):
+    os.makedirs(capture_dir)
+
+excel_filename = "results.xlsx"
+
+# =======================
+# Main Loop
+# =======================
 while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("Camera not detected!")
-        break
+    t_start = time.perf_counter()
 
-    # Run YOLO detection
+    if source_type in ['image','folder']:
+        if img_count >= len(imgs_list):
+            print("All images processed.")
+            break
+        frame = cv2.imread(imgs_list[img_count])
+        img_count += 1
+    else:
+        ret, frame = cap.read()
+        if not ret:
+            print("End of video or camera error.")
+            break
+
+    if resize:
+        frame = cv2.resize(frame, (resW, resH))
+
     results = model(frame, verbose=False)
     detections = results[0].boxes
+    object_count = 0
 
-    # Draw bounding boxes on frame
-    for box in detections:
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
-        conf = float(box.conf[0])
-        cls = int(box.cls[0])
-        label = f"{labels[cls]} {conf:.2f}"
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(frame, label, (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    for det in detections:
+        xyxy = det.xyxy.cpu().numpy().squeeze().astype(int)
+        classidx = int(det.cls.item())
+        conf = det.conf.item()
+        if conf >= float(min_thresh):
+            xmin, ymin, xmax, ymax = xyxy
+            classname = labels[classidx]
+            color = bbox_colors[classidx % len(bbox_colors)]
+            cv2.rectangle(frame, (xmin,ymin), (xmax,ymax), color, 2)
+            label = f'{classname}: {int(conf*100)}%'
+            cv2.putText(frame, label, (xmin, max(ymin-10,15)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            object_count += 1
 
-    # Display
-    cv2.imshow("YOLO Bottle Level Detection", frame)
+    t_stop = time.perf_counter()
+    frame_rate_calc = float(1/(t_stop - t_start))
+    frame_rate_buffer.append(frame_rate_calc)
+    if len(frame_rate_buffer) > fps_avg_len:
+        frame_rate_buffer.pop(0)
+    avg_frame_rate = np.mean(frame_rate_buffer)
 
-    key = cv2.waitKey(1) & 0xFF
+    cv2.putText(frame, f'Objects: {object_count}', (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+    cv2.putText(frame, f'FPS: {avg_frame_rate:.2f}', (10,60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+    cv2.imshow("YOLO Detection Results", frame)
 
-    # Quit
+    if record:
+        recorder.write(frame)
+
+    # =======================
+    # Save Captured Image + Excel Data
+    # =======================
+    capture_name = f"image{image_number}.jpg"
+    capture_path = os.path.join(capture_dir, capture_name)
+    cv2.imwrite(capture_path, frame)
+
+    frame_name = capture_name
+    output_data = []
+    for det in detections:
+        classidx = int(det.cls.item())
+        classname = labels[classidx]
+        conf = round(det.conf.item() * 100, 2)
+        output_data.append([
+            frame_name,
+            classname,
+            conf,
+            object_count,
+            round(avg_frame_rate, 2),
+            capture_name
+        ])
+
+    df_new = pd.DataFrame(output_data, columns=['Frame/Image', 'Class', 'Confidence (%)', 'Object Count', 'FPS', 'Captured Image'])
+
+    if not os.path.exists(excel_filename):
+        df_new.to_excel(excel_filename, index=False)
+    else:
+        df_existing = pd.read_excel(excel_filename)
+        df_final = pd.concat([df_existing, df_new], ignore_index=True)
+        df_final.to_excel(excel_filename, index=False)
+
+    image_number += 1  # increase image count for next save
+
+    # =======================
+    # Key Controls
+    # =======================
+    key = cv2.waitKey(5)
     if key == ord('q') or key == ord('Q'):
         break
+    elif key == ord('s') or key == ord('S'):
+        cv2.waitKey()
+    elif key == ord('p') or key == ord('P'):
+        cv2.imwrite('manual_capture.png', frame)
 
-    # Capture
-    elif key == ord('c') or key == ord('C'):
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        serial_no += 1
-        img_name = f"{serial_no:03d}capture{timestamp}.png"
-        img_path = os.path.join(image_folder, img_name)
-        cv2.imwrite(img_path, frame)
-        print(f"[{serial_no}] Image saved in {img_path}")
-
-        detected_level = "Unknown"
-        confidence_value = 0
-        x = y = w = h = 0
-
-        if len(detections) > 0:
-            best_det = max(detections, key=lambda d: d.conf.item())
-            classidx = int(best_det.cls.item())
-            classname = labels[classidx].lower()
-            confidence_value = round(best_det.conf.item() * 100, 2)
-
-            # Get bounding box
-            x1, y1, x2, y2 = map(int, best_det.xyxy[0])
-            w = x2 - x1
-            h = y2 - y1
-            x = x1
-            y = y1
-
-            # Determine detected level
-            if "full" in classname:
-                detected_level = "Full level"
-            elif "half" in classname:
-                detected_level = "Half level"
-            elif "empty" in classname:
-                detected_level = "Empty level"
-            else:
-                detected_level = classname.capitalize()
-
-        # Log to Excel (store only file name)
-        ws.append([serial_no, timestamp, img_name, detected_level,
-                   confidence_value, x, y, w, h])
-        wb.save(excel_file)
-
-        print(f"Logged: {detected_level} ({confidence_value}%) at [{x}, {y}, {w}, {h}]")
-
-# ---------------------- Cleanup ----------------------
-cap.release()
+# =======================
+# Cleanup
+# =======================
+print(f"Average pipeline FPS: {avg_frame_rate:.2f}")
+if source_type in ['video','usb']:
+    cap.release()
+if record:
+    recorder.release()
 cv2.destroyAllWindows()
-wb.save(excel_file)
-print("Detection session ended. Excel saved successfully.")
