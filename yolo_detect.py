@@ -1,127 +1,112 @@
-import os
-import sys
 import cv2
-import numpy as np
-import pandas as pd
+import os
 from datetime import datetime
 from ultralytics import YOLO
+from openpyxl import Workbook, load_workbook
 
-# ===============================
-# USER CONFIGURATION
-# ===============================
-MODEL_PATHS = [
-    r"C:\Users\Admin\Documents\YOLO\my_model\train\weights\best.pt",
-    r"C:\Users\Admin\Documents\YOLO\my_model\train\weights\best.pt"  # Replace if second model is different
-]
-CONF_THRESHOLD = 0.5                   # minimum confidence
-EXCEL_FILE = "bottle_data.xlsx"        # Excel sheet to save results
-SAVE_IMAGE_FOLDER = "captures"         # folder to save images
-CAMERA_INDEX = 0                        # 0 = default laptop camera
+# ---------------------- YOLO Model ----------------------
+model_path = r"C:\Users\Admin\Documents\YOLO\my_model\train\weights\best.pt"
+model = YOLO(model_path)
+labels = model.names
 
-# Create folder for captured images
-os.makedirs(SAVE_IMAGE_FOLDER, exist_ok=True)
+# ---------------------- Folder Setup ----------------------
+image_folder = "Captured_Images"
+os.makedirs(image_folder, exist_ok=True)
 
-# ===============================
-# LOAD MODELS
-# ===============================
-models = []
-for path in MODEL_PATHS:
-    if not os.path.exists(path):
-        print(f"❌ Model path not found: {path}")
-        sys.exit()
-    print(f"🔄 Loading YOLO model: {path}")
-    models.append(YOLO(path))
-print("✅ All models loaded successfully!")
+# ---------------------- Excel Setup ----------------------
+excel_file = 'detected_levels.xlsx'
+if not os.path.exists(excel_file):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Detections"
+    ws.append(["S.No", "Timestamp", "Captured Image", "Detected Level",
+               "Confidence (%)", "X", "Y", "Width", "Height"])
+    wb.save(excel_file)
+else:
+    wb = load_workbook(excel_file)
+    ws = wb.active
 
-# ===============================
-# OPEN CAMERA
-# ===============================
-cap = cv2.VideoCapture(CAMERA_INDEX)
-if not cap.isOpened():
-    print("❌ Camera not detected.")
-    sys.exit()
-print("✅ Camera connected.")
+# Find next serial number automatically
+serial_no = ws.max_row  # header row counts as 1
 
-# ===============================
-# MAIN LOOP
-# ===============================
-print("Press 'p' to capture bottle data and save image.")
-print("Press 'q' to quit.\n")
+# ---------------------- Camera Setup ----------------------
+cap = cv2.VideoCapture(0)
+print("Press 'C' to capture, 'Q' to quit")
 
 while True:
     ret, frame = cap.read()
     if not ret:
-        print("❌ Failed to capture frame from camera.")
+        print("Camera not detected!")
         break
 
-    all_detections = []
+    # Run YOLO detection
+    results = model(frame, verbose=False)
+    detections = results[0].boxes
 
-    # Run both models on the same frame
-    for model in models:
-        results = model(frame, verbose=False)
-        all_detections.extend(results[0].boxes)
+    # Draw bounding boxes on frame
+    for box in detections:
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        conf = float(box.conf[0])
+        cls = int(box.cls[0])
+        label = f"{labels[cls]} {conf:.2f}"
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(frame, label, (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-    # Draw green bounding boxes and prepare Excel data
-    bottle_data = []
-    for i, det in enumerate(all_detections):
-        xyxy = det.xyxy.cpu().numpy().squeeze()
-        xmin, ymin, xmax, ymax = xyxy.astype(int)
-        classidx = int(det.cls.item())
-        classname = model.names[classidx]  # Full, Half, Empty
-        conf = det.conf.item()
+    # Display
+    cv2.imshow("YOLO Bottle Level Detection", frame)
 
-        if conf >= CONF_THRESHOLD:
-            # Draw green bounding box
-            cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
-            cv2.putText(frame, f"{classname} ({conf*100:.1f}%)", (xmin, ymin - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-            # Save data for Excel
-            bottle_data.append({
-                "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "Bottle_ID": i + 1,
-                "Class_Name": classname,
-                "Status": classname,
-                "Confidence": round(conf, 3),
-                "Xmin": xmin,
-                "Ymin": ymin,
-                "Xmax": xmax,
-                "Ymax": ymax
-            })
-
-    # Display the camera feed
-    cv2.imshow("Bottle Detection", frame)
     key = cv2.waitKey(1) & 0xFF
 
-    # Quit program
-    if key == ord('q'):
+    # Quit
+    if key == ord('q') or key == ord('Q'):
         break
 
-    # Capture data and save
-    elif key == ord('p'):
-        if len(bottle_data) > 0:
-            img_name = f"capture_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-            img_path = os.path.join(SAVE_IMAGE_FOLDER, img_name)
-            cv2.imwrite(img_path, frame)
+    # Capture
+    elif key == ord('c') or key == ord('C'):
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        serial_no += 1
+        img_name = f"{serial_no:03d}capture{timestamp}.png"
+        img_path = os.path.join(image_folder, img_name)
+        cv2.imwrite(img_path, frame)
+        print(f"[{serial_no}] Image saved in {img_path}")
 
-            df_new = pd.DataFrame(bottle_data)
-            df_new["Image_File"] = img_name
+        detected_level = "Unknown"
+        confidence_value = 0
+        x = y = w = h = 0
 
-            if os.path.exists(EXCEL_FILE):
-                df_existing = pd.read_excel(EXCEL_FILE)
-                df_all = pd.concat([df_existing, df_new], ignore_index=True)
-                df_all.to_excel(EXCEL_FILE, index=False)
+        if len(detections) > 0:
+            best_det = max(detections, key=lambda d: d.conf.item())
+            classidx = int(best_det.cls.item())
+            classname = labels[classidx].lower()
+            confidence_value = round(best_det.conf.item() * 100, 2)
+
+            # Get bounding box
+            x1, y1, x2, y2 = map(int, best_det.xyxy[0])
+            w = x2 - x1
+            h = y2 - y1
+            x = x1
+            y = y1
+
+            # Determine detected level
+            if "full" in classname:
+                detected_level = "Full level"
+            elif "half" in classname:
+                detected_level = "Half level"
+            elif "empty" in classname:
+                detected_level = "Empty level"
             else:
-                df_new.to_excel(EXCEL_FILE, index=False)
+                detected_level = classname.capitalize()
 
-            print(f"✅ {len(bottle_data)} bottles saved to {EXCEL_FILE}")
-            print(f"✅ Image saved as {img_name}\n")
-        else:
-            print("⚠️ No bottles detected in this frame.\n")
+        # Log to Excel (store only file name)
+        ws.append([serial_no, timestamp, img_name, detected_level,
+                   confidence_value, x, y, w, h])
+        wb.save(excel_file)
 
-# ===============================
-# CLEANUP
-# ===============================
+        print(f"Logged: {detected_level} ({confidence_value}%) at [{x}, {y}, {w}, {h}]")
+
+# ---------------------- Cleanup ----------------------
 cap.release()
 cv2.destroyAllWindows()
-print("Program closed successfully.")
+wb.save(excel_file)
+print("Detection session ended. Excel saved successfully.")
